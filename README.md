@@ -25,10 +25,15 @@ chmod +x php74-cve.sh
 ./php74-cve.sh uninstall   # roll back to the previous versions
 ```
 
-The RPMs are published as [release assets](https://github.com/bagsiz/el7-php74-security/releases/tag/v7.4.33-31).
+The RPMs are published as [release assets](https://github.com/bagsiz/el7-php74-security/releases/tag/v7.4.33-31.1).
 `install` downloads the archive it needs and checks it against a SHA256 that is hardcoded
 in the script. If the server has no internet access, download the archive by hand and put
 it next to the script.
+
+> **Old CentOS 7 (7.0–7.3) with the original CA bundle:** the stock `ca-certificates` of
+> those releases does not trust the certificates of `raw.githubusercontent.com` and GitHub's
+> release download host, so `curl` fails with a TLS/certificate error. Run
+> `yum update ca-certificates`, or download the files on another machine and copy them over.
 
 ### Network timeouts
 
@@ -46,7 +51,7 @@ Environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `PHP74CVE_NET_TIMEOUT` | `10` | Network timeout in seconds, e.g. `PHP74CVE_NET_TIMEOUT=30 ./php74-cve.sh install` on a slow link |
-| `PHP74CVE_RELEASE_URL` | this repo's `v7.4.33-31` release | Download the archives from a mirror or an internal server instead |
+| `PHP74CVE_RELEASE_URL` | this repo's `v7.4.33-31.1` release | Download the archives from a mirror or an internal server instead |
 
 ## What it detects
 
@@ -163,18 +168,23 @@ recorded in `sources.txt` inside the backup directory:
 WARNING: some RPMs were rebuilt from the installed files with rpmrebuild (unsigned, not identical to the original)
 ```
 
-## Package contents (`7.4.33-31.el7`)
+## Package contents (`7.4.33-31.1.el7`)
+
+> `31.1` replaces `31`. The `31` packages were built on CentOS 7.9 and need openssl 1.0.2,
+> so they do not run on CentOS 7.0–7.3 (openssl 1.0.1e). `31.1` adds
+> `php-7.4-el7-openssl101-compat.patch` (see below). Servers on `31` are upgraded by `install`.
 
 Both builds come from Remi Collet's `7.4.33-31` source packages (2026-10-21). They already
 contain the fix as `php-7.4-cve-2026-109618.patch` ("Avoid state corruption via bailout"),
 along with every security fix Remi backported to 7.4 since the last EL7 build (`-15`, June
-2024). They were rebuilt for CentOS 7 without code changes.
+2024). They were rebuilt for CentOS 7; the only code change is the openssl compatibility
+patch.
 
 - **base** (`php74-rpms-base.tar.gz`, `php-*`): Remi's `php-7.4.33-31` SRPM, which is the
   package `remi-php74` servers run. File lists, config files, scriptlets, provides and
-  requires are identical to Remi's last EL7 build (`7.4.33-15.el7.remi`) in 89 of 90
-  checks. Only the version strings differ, and one sentence of the post-install EOL notice
-  ("backported from 8.1" → "8.2").
+  requires were compared with Remi's last EL7 build (`7.4.33-15.el7.remi`) and are identical
+  in 89 of 90 checks. Only the version strings differ, and one sentence of the post-install
+  EOL notice ("backported from 8.1" → "8.2").
 - **scl** (`php74-rpms-scl.tar.gz`, `php74-php-*`): Remi's `php74-php-7.4.33-31` SRPM.
 
 Build notes, the same as Remi's own EL7 builds:
@@ -184,6 +194,32 @@ Build notes, the same as Remi's own EL7 builds:
   ICU 74 patch only changes the C++ standard for ICU 74 and later.
 - The SRPMs were checked against Remi's 2026 key before building (`rpm -K`: `digests
   signatures OK`).
+
+### Runs on every CentOS 7 release (7.0–7.9)
+
+The packages are built on CentOS 7.9, which has openssl 1.0.2k. Linked against it, PHP used
+five functions that CentOS 7.0–7.3 (openssl 1.0.1e) do not have:
+
+- `SSLeay_version` in its `OPENSSL_1.0.2` symbol version
+- `X509_get_signature_nid`
+- `SSL_CTX_set_alpn_protos`, `SSL_CTX_set_alpn_select_cb` and `SSL_get0_alpn_selected` (ALPN)
+
+`php-7.4-el7-openssl101-compat.patch` (in `ext/openssl/openssl.c` and `xp_ssl.c`) no longer
+links these functions. It looks them up at run time with `dlsym()` in the already loaded
+`libssl`/`libcrypto`:
+
+- **CentOS 7.4–7.9 (openssl 1.0.2k):** everything works as before, including ALPN.
+- **CentOS 7.0–7.3 (openssl 1.0.1e):** PHP behaves as when built against openssl 1.0.1.
+  The `alpn_protocols` stream context option gives a warning and is ignored.
+
+After the patch, every `libssl`/`libcrypto` symbol the packages use (361) exists in CentOS
+7.0's openssl. This was checked on the built binaries.
+
+**Known limitation, `php-gd` on CentOS 7.0–7.5:** `php-gd` uses Remi's `gd3php`, which
+pulls `libraqm` from EPEL, which needs fribidi ≥ 1.0. fribidi 1.0 arrived in CentOS 7.6.
+Remi's own builds have the same dependency. On older releases `gd.so` fails to load. The
+installer's verification sees the load warning and rolls the upgrade back. Updating
+`fribidi` fixes it.
 
 ## Behaviour changes
 
@@ -224,6 +260,11 @@ Everything was tested in clean CentOS 7 containers against Remi's `7.4.33-15` pa
   run on the SCL build. The only differences from Remi's `7.4.33-15` are the expected ones:
   the `session.upload_progress` (`rfc1867*`) tests fail, and one out-of-memory message has
   a cosmetic difference.
+- **Old CentOS 7 (openssl 1.0.1e):** tested on `centos:7.3.1611` for base and SCL. The
+  patched packages install through the installer, and the following work: PHP, php-fpm,
+  the openssl extension and the `alpn_protocols` option (warning, no crash). mysqlnd, pdo,
+  xml, mbstring, intl, opcache, soap, process, bcmath, ldap and pgsql load without
+  warnings; gd is the exception, see the known limitation above.
 - **Rollback backups and bundled `rpmrebuild`:** same code as `el7-php70-security`, which
   was tested with the yum cache only, the repositories only, `rpmrebuild` only, an offline
   server, and the bundled `rpm-build` on every CentOS 7 release (`7.0.1406` … `7.9.2009`).
