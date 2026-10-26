@@ -122,6 +122,19 @@ obsoletes `gd-last`. On a server whose current `php-gd` is an older build that n
 detects this beforehand (yum dry run), backs `gd-last` up together with the PHP RPMs, and
 `uninstall` puts it back and removes `gd3php` again once nothing needs it.
 
+**Extensions copied by hand.** A PHP extension that is on disk without a package (for
+example `/usr/lib64/php/modules/gd.so` copied from another build, with no `php-gd`
+installed) still uses the libraries it was built against, which rpm does not know about.
+When the patched package of that extension exists here, `install` installs it in place of
+the copied files (listed before confirming, backed up to `adopted-files.tar.gz`);
+`uninstall` removes the package and puts the original files back.
+
+**Order and final check.** With both install types on one server, SCL is upgraded first,
+then base. Afterwards both PHP installs are checked again (`php -m` without warnings,
+`php-fpm -t`, …), since a later transaction can break the PHP checked earlier, for example
+by replacing a library a hand-copied extension needs. If any check fails, every install
+type upgraded in that run is rolled back.
+
 **Known limitation:** when base `php-gd` and SCL `php74-php-gd` are both installed and
 both are such older builds, each install type's transaction would remove `gd-last` that
 the other one still needs. yum refuses that transaction and nothing is changed ("yum
@@ -283,6 +296,12 @@ Everything was tested in clean CentOS 7 containers against Remi's `7.4.33-15` pa
   (as older Remi builds do). The install removed `gd-last`; `uninstall` restored it from
   the backup, removed `gd3php`, and the old `gd` extension loaded again with no unsatisfied
   dependencies in the RPM database (8 checks).
+- **Hand-copied extension:** a server with SCL `php-gd` needing `gd-last` and base mod_php
+  loading a hand-copied `gd.so` linked to `gd-last` (no `php-gd` package). `install`
+  installed the patched `php-gd` in its place, and both PHPs loaded gd. `uninstall`
+  restored the original files byte for byte (15 checks). With an extension that has no
+  patched package (`gd_custom.so`), the base check failed and both install types were
+  rolled back to the exact previous state (11 checks).
 - **Not covered:** real systemd and Apache. The containers used a stub `systemctl`. Run
   `status` and `install` on one server and check the output before rolling out further.
 
