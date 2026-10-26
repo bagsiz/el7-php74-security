@@ -270,8 +270,8 @@ is_patched() { # NAME
 #            Unsigned; config files go in as they are now (that is what a rollback needs).
 # Prints the source used; returns 1 if none worked.
 # PHP74CVE_BACKUP_SOURCES limits the sources (testing); PHP74CVE_NO_DOWNLOAD=1 disables all.
-backup_rpm() { # NAME VERSION-RELEASE DESTDIR
-    local name=$1 vr=$2 dest=$3 nevra="$1-$2.x86_64" src f tmp
+backup_rpm() { # NAME VERSION-RELEASE DESTDIR [ARCH]
+    local name=$1 vr=$2 dest=$3 nevra="$1-$2.${4:-x86_64}" src f tmp
     local sources=${PHP74CVE_BACKUP_SOURCES:-cache repo rebuild}
     [ -n "${PHP74CVE_NO_DOWNLOAD:-}" ] && sources=""
     for src in $sources; do
@@ -295,7 +295,7 @@ backup_rpm() { # NAME VERSION-RELEASE DESTDIR
             # disk (docs not installed, deleted by hand) are dropped from %files
             if rpmrebuild --batch --notest-install \
                     --define '_binary_filedigest_algorithm 8' --define '_binary_payload w9.xzdio' \
-                    --change-spec-files="$RR_FILTER" --directory="$tmp" "$name" >/dev/null 2>&1; then
+                    --change-spec-files="$RR_FILTER" --directory="$tmp" "$nevra" >/dev/null 2>&1; then
                 f=$(find "$tmp" -name "$nevra.rpm" | head -1)
                 [ -n "$f" ] && mv "$f" "$dest/$nevra.rpm" && { rm -rf "$tmp"; echo rebuild; return 0; }
             fi
@@ -479,12 +479,24 @@ install_mode() {
         echo "  configuration: $backup/config.tar.gz"
     fi
 
+    # Installed packages the yum transaction replaces: a new dependency obsoletes them (for
+    # example gd3php obsoletes gd-last, which older php-gd builds need). The old PHP
+    # packages need them back on rollback, so they are backed up too.
+    : > "$backup/replaced.txt"
+    yum "${YUM_NET[@]}" --assumeno localinstall "${files[@]}" 2>/dev/null |
+        awk '$1 == "replacing" { n = $2; a = n; sub(/\.[^.]*$/, "", n); sub(/.*\./, "", a)
+                                 vr = $3; sub(/^[0-9]+:/, "", vr); print n, a, vr }' | sort -u > "$backup/replaced.txt"
+    if [ -s "$backup/replaced.txt" ]; then
+        echo "  the install replaces: $(awk '{printf "%s%s-%s.%s", (NR > 1 ? ", " : ""), $1, $3, $2}' "$backup/replaced.txt")"
+    fi
+
     # RPMs of the current versions, for rollback: yum cache, then repositories, then rpmrebuild
-    local missing=() nevra line src
-    for line in "${upgrade[@]}"; do
+    local missing=() nevra line src total=0 todo=()
+    mapfile -t todo < <(printf '%s\n' "${upgrade[@]}"; awk '{print $1, $3, $2}' "$backup/replaced.txt")
+    for line in "${todo[@]}"; do
         set -- $line
-        nevra="$1-$2.x86_64"
-        if src=$(backup_rpm "$1" "$2" "$backup/rpms"); then
+        nevra="$1-$2.${3:-x86_64}"; total=$((total + 1))
+        if src=$(backup_rpm "$1" "$2" "$backup/rpms" "${3:-x86_64}"); then
             echo "$nevra $src" >> "$backup/sources.txt"
             printf '  %-48s %s\n' "$nevra" "$src"
         else
@@ -492,7 +504,7 @@ install_mode() {
         fi
     done
     cleanup_tools
-    echo "  RPMs of the current versions: $(( ${#upgrade[@]} - ${#missing[@]} ))/${#upgrade[@]} backed up"
+    echo "  RPMs of the current versions: $(( total - ${#missing[@]} ))/$total backed up"
     if grep -q ' rebuild$' "$backup/sources.txt" 2>/dev/null; then
         warn "some RPMs were rebuilt from the installed files with rpmrebuild (unsigned, not identical to the original)"
     fi
@@ -505,9 +517,12 @@ install_mode() {
     ln -sfn "$backup" "$STATE_DIR/current"
 
     say "Installing the patched packages ($TITLE)"
+    rpm -qa --qf '%{NAME}\n' | sort -u > "$backup/rpmqa-before.txt"
     if ! yum "${YUM_NET[@]}" -y localinstall "${files[@]}"; then
         die "yum install failed; nothing was changed (the yum transaction was rolled back). Backup: $backup"
     fi
+    # new dependencies (removed again on rollback when nothing else needs them)
+    rpm -qa --qf '%{NAME}\n' | sort -u | comm -13 "$backup/rpmqa-before.txt" - > "$backup/added.txt"
 
     local failed=0
     verify || failed=1
@@ -521,6 +536,27 @@ install_mode() {
         die "the install was rolled back"
     fi
     say "Done: $TITLE upgraded to the patched version ($PATCHED_VR)"
+}
+
+# Remove the dependencies the install added (backup/added.txt, e.g. gd3php) once nothing
+# needs them any more. One at a time, until no more can go: they may need each other.
+remove_added() { # BACKUP
+    [ -s "$1/added.txt" ] || return 0
+    local p left removed=() more=1
+    while [ $more = 1 ]; do
+        more=0; left=()
+        while read -r p; do
+            rpm -q "$p" >/dev/null 2>&1 || continue
+            if rpm -e --test "$p" >/dev/null 2>&1 && rpm -e "$p" >/dev/null 2>&1; then
+                removed+=("$p"); more=1
+            else
+                left+=("$p")
+            fi
+        done < "$1/added.txt"
+    done
+    [ ${#removed[@]} -gt 0 ] && echo "  removed the dependencies the install had added: ${removed[*]}"
+    [ ${#left[@]} -gt 0 ] && echo "  kept (still needed): ${left[*]}"
+    return 0
 }
 
 uninstall_mode() {
@@ -542,6 +578,23 @@ uninstall_mode() {
             repo_pkgs+=("$name")
         fi
     done < "$backup/upgraded.txt"
+    # Packages an install replaced (see install_mode). Both install types are checked: when
+    # base was installed first, it replaced gd-last, and the old scl packages need it too.
+    local arch b r
+    for b in "$backup" "$STATE_ROOT"/*/current; do
+        [ -f "$b/replaced.txt" ] || continue
+        b=$(readlink -f "$b")
+        while read -r name arch vr; do
+            [ -n "$name" ] || continue
+            rpm -q "$name-$vr.$arch" >/dev/null 2>&1 && continue
+            r=$b/rpms/$name-$vr.$arch.rpm
+            if [ ! -f "$r" ]; then
+                warn "$name-$vr.$arch was replaced by the install and is not in the backup"
+            elif ! printf '%s\n' ${local_rpms[@]+"${local_rpms[@]}"} | grep -q "/$name-$vr.$arch.rpm$"; then
+                local_rpms+=("$r")
+            fi
+        done < "$b/replaced.txt"
+    done
 
     if [ ${#local_rpms[@]} -eq 0 ] && [ ${#repo_pkgs[@]} -eq 0 ]; then
         say "$TITLE: no patched packages to roll back"
@@ -558,11 +611,24 @@ uninstall_mode() {
     confirm "Continue?" || die "aborted"
 
     if [ ${#local_rpms[@]} -gt 0 ]; then
-        rpm -Uvh --oldpackage "${local_rpms[@]}" || die "rpm downgrade failed"
+        # A restored replaced package is "obsoleted by (installed)" its replacement (gd-last
+        # by gd3php), which rpm refuses. When that is the only problem, install without the
+        # dependency check; remove_added then removes the replacement if nothing needs it.
+        local test_out nodeps=()
+        if ! test_out=$(rpm -U --test --oldpackage "${local_rpms[@]}" 2>&1); then
+            if printf '%s\n' "$test_out" | grep -v -e '^error: Failed dependencies:' \
+                    -e 'is obsoleted by (installed)' | grep -q .; then
+                printf '%s\n' "$test_out" >&2
+                die "rpm downgrade failed"
+            fi
+            nodeps=(--nodeps)
+        fi
+        rpm -Uvh --oldpackage ${nodeps[@]+"${nodeps[@]}"} "${local_rpms[@]}" || die "rpm downgrade failed"
     fi
     if [ ${#repo_pkgs[@]} -gt 0 ]; then
         yum "${YUM_NET[@]}" -y downgrade "${repo_pkgs[@]}" || die "yum downgrade failed"
     fi
+    remove_added "$backup"
 
     local services
     services=$(cat "$backup/services.txt" 2>/dev/null)
@@ -582,8 +648,9 @@ main() {
     [ "$CMD" = status ] || preflight
 
     if [ "$CMD" = uninstall ]; then
-        # rollback: every install type installed by this script
-        modes=$(for m in base scl; do [ -L "$STATE_ROOT/$m/current" ] && echo $m; done)
+        # rollback: every install type installed by this script, in reverse install order
+        # (base installs first, so its new dependencies such as gd3php go last)
+        modes=$(for m in scl base; do [ -L "$STATE_ROOT/$m/current" ] && echo $m; done)
         [ -n "$modes" ] || die "nothing to roll back ($STATE_ROOT); nothing was installed by this script"
     else
         print_discovery
